@@ -1,8 +1,6 @@
 """
 Run the Artificial Fever scraper: scrape products, compute embeddings, upsert to Supabase.
 """
-import os
-import sys
 import argparse
 
 # Load .env before any other local imports
@@ -23,6 +21,8 @@ def run(dry_run: bool = False, limit: int | None = None):
     for i, payload in enumerate(scrape_all_products(session)):
         if limit is not None and i >= limit:
             break
+        if not (payload.get("image_url") or "").strip():
+            continue  # table requires image_url not null
         image_emb, info_emb = None, None
         if not dry_run:
             image_url = payload.get("image_url")
