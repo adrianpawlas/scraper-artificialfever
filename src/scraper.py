@@ -12,6 +12,7 @@ COLLECTIONS = [
     ("frontpage", False),   # (handle, is_sale_collection)
     ("full-storage-sale", True),
 ]
+WOMENS_COLLECTION_HANDLE = "womens"
 
 
 def _session() -> requests.Session:
@@ -90,6 +91,7 @@ def build_product_payload(
     collection_handle: str,
     collection_title: str,
     is_sale_collection: bool,
+    is_womens: bool = False,
 ) -> dict:
     """Build a flat payload for DB from Shopify product + collection context."""
     handle = product.get("handle") or ""
@@ -149,11 +151,14 @@ def build_product_payload(
     else:
         category = normalize_category(collection_title)
 
+    gender = "woman" if is_womens else "man"
+
     # Metadata: all info in one place
     metadata_parts = [
         f"title: {title}",
         f"description: {description}",
         f"category: {category}",
+        f"gender: {gender}",
         f"price: {price_str}",
         f"sale: {sale_str}" if sale_str else "",
         f"sizes: {', '.join(sizes)}" if sizes else "",
@@ -174,7 +179,7 @@ def build_product_payload(
         "price": price_str or None,
         "sale": sale_str or None,
         "category": category or None,
-        "gender": "man",
+        "gender": gender,
         "metadata": metadata_str or None,
         "size": ", ".join(sizes) if sizes else None,
         "second_hand": False,
@@ -197,6 +202,13 @@ def _sale_collection_handles(session: requests.Session) -> set[str]:
     return sale_handles
 
 
+def _womens_collection_handles(session: requests.Session) -> set[str]:
+    """Return set of product handles that appear in the womens collection."""
+    return set(
+        fetch_collection_product_handles(session, WOMENS_COLLECTION_HANDLE)
+    )
+
+
 def scrape_all_products(session: requests.Session | None = None) -> Iterator[dict]:
     """
     Scrape all products from configured collections.
@@ -205,6 +217,7 @@ def scrape_all_products(session: requests.Session | None = None) -> Iterator[dic
     """
     session = session or _session()
     sale_handles = _sale_collection_handles(session)
+    womens_handles = _womens_collection_handles(session)
     seen_handles: set[str] = set()
 
     for collection_handle, is_sale_collection in COLLECTIONS:
@@ -217,12 +230,13 @@ def scrape_all_products(session: requests.Session | None = None) -> Iterator[dic
             time.sleep(0.2)
             if not product:
                 continue
-            # Use sale column when product is in sale collection (or has compare_at_price)
             in_sale = handle in sale_handles
+            is_womens = handle in womens_handles
             payload = build_product_payload(
                 product,
                 collection_handle,
                 collection_title,
                 in_sale,
+                is_womens=is_womens,
             )
             yield payload
