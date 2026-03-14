@@ -31,7 +31,6 @@ class SigLIPEmbedder:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Loading '{model_name}' on {self.device} …")
         self.processor = AutoProcessor.from_pretrained(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name).to(self.device)
         self.model.eval()
         logger.info("Model ready.")
@@ -86,8 +85,8 @@ class SigLIPEmbedder:
 
         for attempt in range(1, retries + 1):
             try:
-                inputs = self.tokenizer(
-                    str(text)[:10_000],
+                inputs = self.processor(
+                    text=[str(text)[:10_000]],
                     padding="max_length",
                     truncation=True,
                     max_length=SIGLIP_MAX_TEXT_LENGTH,
