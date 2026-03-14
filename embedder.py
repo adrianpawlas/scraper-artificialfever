@@ -91,14 +91,12 @@ class SigLIPEmbedder:
                     truncation=True,
                     max_length=SIGLIP_MAX_TEXT_LENGTH,
                     return_tensors="pt",
+                    return_attention_mask=True,
                 )
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
                 with torch.no_grad():
-                    outputs = self.model.get_text_features(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                    )
+                    outputs = self.model.get_text_features(**inputs)
                     if hasattr(outputs, 'pooler_output'):
                         features = outputs.pooler_output
                     else:
