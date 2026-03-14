@@ -1,27 +1,32 @@
 """
-Scrape Artificial Fever (Shopify) collections and product details.
+scraper.py — Fetches all products from Artificial Fever's Shopify JSON API.
+
+Artificial Fever runs on Shopify, which exposes a public products.json endpoint.
+We paginate using ?limit=250&page=N until we receive an empty result set.
+No browser automation needed.
 """
+
+import logging
 import re
 import time
-from typing import Iterator
+
 import requests
 from bs4 import BeautifulSoup
 
-BASE_URL = "https://artificialfever.com"
-COLLECTIONS = [
-    ("frontpage", False),   # (handle, is_sale_collection)
-    ("full-storage-sale", True),
-]
-WOMENS_COLLECTION_HANDLE = "womens"
+from config import (
+    BASE_URL,
+    COLLECTIONS,
+    REQUEST_HEADERS,
+    REQUEST_TIMEOUT,
+    WOMENS_COLLECTION_HANDLE,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
+    s.headers.update(REQUEST_HEADERS)
     return s
 
 
@@ -36,13 +41,15 @@ def fetch_collection_product_handles(
     session: requests.Session,
     collection_handle: str,
     limit: int = 250,
-) -> Iterator[str]:
-    """Yield product handles from a collection, paginating until 0 products."""
+) -> list[str]:
+    """Fetch all product handles from a collection, paginating until empty."""
+    handles: list[str] = []
     page = 1
+
     while True:
         url = f"{BASE_URL}/collections/{collection_handle}/products.json"
         params = {"limit": limit, "page": page}
-        r = session.get(url, params=params, timeout=30)
+        r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         products = data.get("products") or []
@@ -51,18 +58,17 @@ def fetch_collection_product_handles(
         for p in products:
             handle = p.get("handle")
             if handle:
-                yield handle
+                handles.append(handle)
         page += 1
         time.sleep(0.3)
 
+    return handles
 
-def fetch_product(
-    session: requests.Session,
-    handle: str,
-) -> dict | None:
+
+def fetch_product(session: requests.Session, handle: str) -> dict | None:
     """Fetch full product JSON by handle."""
     url = f"{BASE_URL}/products/{handle}.json"
-    r = session.get(url, timeout=30)
+    r = session.get(url, timeout=REQUEST_TIMEOUT)
     if not r.ok:
         return None
     data = r.json()
@@ -72,7 +78,7 @@ def fetch_product(
 def get_collection_title(session: requests.Session, collection_handle: str) -> str:
     """Get collection title for category mapping."""
     url = f"{BASE_URL}/collections/{collection_handle}.json"
-    r = session.get(url, timeout=30)
+    r = session.get(url, timeout=REQUEST_TIMEOUT)
     if not r.ok:
         return collection_handle.replace("-", " ").title()
     data = r.json()
@@ -84,6 +90,13 @@ def normalize_category(category: str) -> str:
     if not category:
         return ""
     return re.sub(r"\s*&\s*", ", ", category.strip())
+
+
+def _parse_tags(tags) -> list[str]:
+    """Parse Shopify tags (string or list) into a clean list."""
+    if isinstance(tags, str):
+        return [t.strip() for t in tags.split(",") if t.strip()]
+    return list(tags) if tags else []
 
 
 def build_product_payload(
@@ -100,13 +113,8 @@ def build_product_payload(
     body_html = product.get("body_html") or ""
     description = _strip_html(body_html)
     product_type = (product.get("product_type") or "").strip()
-    tags = product.get("tags") or ""
-    if isinstance(tags, str):
-        tags_list = [t.strip() for t in tags.split(",") if t.strip()]
-    else:
-        tags_list = list(tags) if tags else []
+    tags_list = _parse_tags(product.get("tags"))
 
-    # Images: first is primary, rest additional
     images = product.get("images") or []
     image_url = ""
     additional_urls: list[str] = []
@@ -114,11 +122,8 @@ def build_product_payload(
         image_url = images[0].get("src") or ""
         additional_urls = [img.get("src") or "" for img in images[1:] if img.get("src")]
 
-    # Variants: price, compare_at_price, options (size, color)
     variants = product.get("variants") or []
-    options = product.get("options") or []
 
-    # Original price (no sale): prefer compare_at_price when it's a sale, else price
     prices_by_currency: dict[str, str] = {}
     sale_prices_by_currency: dict[str, str] = {}
     sizes: list[str] = []
@@ -145,7 +150,6 @@ def build_product_payload(
     if is_sale_collection or sale_prices_by_currency != prices_by_currency:
         sale_str = price_string(sale_prices_by_currency)
 
-    # Category: product_type or collection title
     if product_type:
         category = normalize_category(product_type)
     else:
@@ -153,7 +157,6 @@ def build_product_payload(
 
     gender = "woman" if is_womens else "man"
 
-    # Metadata: all info in one place
     metadata_parts = [
         f"title: {title}",
         f"description: {description}",
@@ -191,47 +194,41 @@ def build_product_payload(
     }
 
 
-def _sale_collection_handles(session: requests.Session) -> set[str]:
-    """Return set of product handles that appear in the sale collection."""
-    sale_handles = set()
-    for collection_handle, is_sale in COLLECTIONS:
-        if not is_sale:
-            continue
-        for handle in fetch_collection_product_handles(session, collection_handle):
-            sale_handles.add(handle)
-    return sale_handles
-
-
-def _womens_collection_handles(session: requests.Session) -> set[str]:
-    """Return set of product handles that appear in the womens collection."""
-    return set(
-        fetch_collection_product_handles(session, WOMENS_COLLECTION_HANDLE)
-    )
-
-
-def scrape_all_products(session: requests.Session | None = None) -> Iterator[dict]:
+def fetch_all_products() -> list[dict]:
     """
     Scrape all products from configured collections.
-    Yields payloads ready for embedding + DB (with raw_product for metadata).
-    Products in full-storage-sale get sale price in sale column.
+    Returns list of payloads ready for embedding + DB.
     """
-    session = session or _session()
-    sale_handles = _sale_collection_handles(session)
-    womens_handles = _womens_collection_handles(session)
+    session = _session()
+
+    sale_handles: set[str] = set()
+    for collection_handle, is_sale in COLLECTIONS:
+        if is_sale:
+            sale_handles.update(fetch_collection_product_handles(session, collection_handle))
+
+    womens_handles: set[str] = set()
+    womens_handles.update(fetch_collection_product_handles(session, WOMENS_COLLECTION_HANDLE))
+
     seen_handles: set[str] = set()
+    all_payloads: list[dict] = []
 
     for collection_handle, is_sale_collection in COLLECTIONS:
         collection_title = get_collection_title(session, collection_handle)
-        for handle in fetch_collection_product_handles(session, collection_handle):
+        handles = fetch_collection_product_handles(session, collection_handle)
+
+        for handle in handles:
             if handle in seen_handles:
                 continue
             seen_handles.add(handle)
+
             product = fetch_product(session, handle)
             time.sleep(0.2)
             if not product:
                 continue
+
             in_sale = handle in sale_handles
             is_womens = handle in womens_handles
+
             payload = build_product_payload(
                 product,
                 collection_handle,
@@ -239,4 +236,7 @@ def scrape_all_products(session: requests.Session | None = None) -> Iterator[dic
                 in_sale,
                 is_womens=is_womens,
             )
-            yield payload
+            all_payloads.append(payload)
+
+    logger.info(f"Total products fetched: {len(all_payloads)}")
+    return all_payloads
